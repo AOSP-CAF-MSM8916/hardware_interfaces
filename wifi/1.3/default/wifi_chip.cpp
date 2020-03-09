@@ -622,13 +622,40 @@ Return<void> WifiChip::debug(const hidl_handle& handle,
     return Void();
 }
 
+void WifiChip::QcRemoveAndClearDynamicIfaces() {
+    for (const auto& iface : created_ap_ifaces_) {
+        std::string ifname = iface->getName();
+        legacy_hal::wifi_error legacy_status =
+            legacy_hal_.lock()->QcRemoveInterface(getWlanIfaceName(0), ifname);
+        if (legacy_status != legacy_hal::WIFI_SUCCESS) {
+            LOG(ERROR) << "Failed to remove interface: " << ifname << " "
+                       << legacyErrorToString(legacy_status);
+        }
+    }
+
+    for (const auto& iface : created_sta_ifaces_) {
+        std::string ifname = iface->getName();
+        legacy_hal::wifi_error legacy_status =
+            legacy_hal_.lock()->QcRemoveInterface(getWlanIfaceName(0), ifname);
+        if (legacy_status != legacy_hal::WIFI_SUCCESS) {
+            LOG(ERROR) << "Failed to remove interface: " << ifname << " "
+                       << legacyErrorToString(legacy_status);
+        }
+    }
+
+    // created_ap/sta_ifaces are also part of sta/ap_ifaces.
+    // Do no invalidate here.
+
+    created_ap_ifaces_.clear();
+    created_sta_ifaces_.clear();
+}
+
 void WifiChip::invalidateAndRemoveAllIfaces() {
+    QcRemoveAndClearDynamicIfaces();
     invalidateAndClearAll(ap_ifaces_);
     invalidateAndClearAll(nan_ifaces_);
     invalidateAndClearAll(p2p_ifaces_);
     invalidateAndClearAll(sta_ifaces_);
-    invalidateAndClearAll(created_ap_ifaces_);
-    invalidateAndClearAll(created_sta_ifaces_);
     // Since all the ifaces are invalid now, all RTT controller objects
     // using those ifaces also need to be invalidated.
     for (const auto& rtt : rtt_controllers_) {
@@ -858,7 +885,11 @@ WifiStatus WifiChip::removeApIfaceInternal(const std::string& ifname) {
     if (!iface.get()) {
         return createWifiStatus(WifiStatusCode::ERROR_INVALID_ARGS);
     }
-
+    // Invalidate & remove any dependent objects first.
+    // Note: This is probably not required because we never create
+    // nan/rtt objects over AP iface. But, there is no harm to do it
+    // here and not make that assumption all over the place.
+    invalidateAndRemoveDependencies(ifname);
     if (findUsingName(created_ap_ifaces_, ifname) != nullptr) {
         legacy_hal::wifi_error legacy_status =
             legacy_hal_.lock()->QcRemoveInterface(getWlanIfaceName(0), ifname);
@@ -868,11 +899,6 @@ WifiStatus WifiChip::removeApIfaceInternal(const std::string& ifname) {
         }
         invalidateAndClear(created_ap_ifaces_, iface);
     }
-    // Invalidate & remove any dependent objects first.
-    // Note: This is probably not required because we never create
-    // nan/rtt objects over AP iface. But, there is no harm to do it
-    // here and not make that assumption all over the place.
-    invalidateAndRemoveDependencies(ifname);
     invalidateAndClear(ap_ifaces_, iface);
     for (const auto& callback : event_cb_handler_.getCallbacks()) {
         if (!callback->onIfaceRemoved(IfaceType::AP, ifname).isOk()) {
@@ -887,8 +913,16 @@ std::pair<WifiStatus, sp<IWifiNanIface>> WifiChip::createNanIfaceInternal() {
     if (!canCurrentModeSupportIfaceOfTypeWithCurrentIfaces(IfaceType::NAN)) {
         return {createWifiStatus(WifiStatusCode::ERROR_NOT_AVAILABLE), {}};
     }
-    // These are still assumed to be based on wlan0.
-    std::string ifname = getFirstActiveWlanIfaceName();
+    std::string ifname = kAwareIfaceName;
+    if (if_nametoindex(ifname.c_str())) {
+        if(!iface_util_.lock()->SetUpState(ifname.c_str(), true))
+           LOG(ERROR) << "Failed to set NAN interface UP " ;
+        else
+           LOG(INFO) << ifname.c_str() << " NAN interface is up";
+    } else {
+        ifname = getFirstActiveWlanIfaceName();
+        LOG(INFO) << ifname.c_str() << " use as NAN interface";
+    }
     sp<WifiNanIface> iface = new WifiNanIface(ifname, legacy_hal_, iface_util_);
     nan_ifaces_.push_back(iface);
     for (const auto& callback : event_cb_handler_.getCallbacks()) {
@@ -1027,6 +1061,8 @@ WifiStatus WifiChip::removeStaIfaceInternal(const std::string& ifname) {
     if (!iface.get()) {
         return createWifiStatus(WifiStatusCode::ERROR_INVALID_ARGS);
     }
+    // Invalidate & remove any dependent objects first.
+    invalidateAndRemoveDependencies(ifname);
     if (findUsingName(created_sta_ifaces_, ifname) != nullptr) {
         legacy_hal::wifi_error legacy_status =
             legacy_hal_.lock()->QcRemoveInterface(getWlanIfaceName(0), ifname);
@@ -1036,8 +1072,6 @@ WifiStatus WifiChip::removeStaIfaceInternal(const std::string& ifname) {
         }
         invalidateAndClear(created_sta_ifaces_, iface);
     }
-    // Invalidate & remove any dependent objects first.
-    invalidateAndRemoveDependencies(ifname);
     invalidateAndClear(sta_ifaces_, iface);
     for (const auto& callback : event_cb_handler_.getCallbacks()) {
         if (!callback->onIfaceRemoved(IfaceType::STA, ifname).isOk()) {
@@ -1284,6 +1318,8 @@ WifiStatus WifiChip::registerDebugRingBufferCallback() {
                 LOG(ERROR) << "Error converting ring buffer status";
                 return;
             }
+            {
+            std::unique_lock<std::mutex> lk(shared_ptr_this->lock_t);
             const auto& target = shared_ptr_this->ringbuffer_map_.find(name);
             if (target != shared_ptr_this->ringbuffer_map_.end()) {
                 Ringbuffer& cur_buffer = target->second;
@@ -1291,6 +1327,7 @@ WifiStatus WifiChip::registerDebugRingBufferCallback() {
             } else {
                 LOG(ERROR) << "Ringname " << name << " not found";
                 return;
+            }
             }
         };
     legacy_hal::wifi_error legacy_status =
@@ -1565,6 +1602,8 @@ bool WifiChip::writeRingbufferFilesInternal() {
         return false;
     }
     // write ringbuffers to file
+    {
+    std::unique_lock<std::mutex> lk(lock_t);
     for (const auto& item : ringbuffer_map_) {
         const Ringbuffer& cur_buffer = item.second;
         if (cur_buffer.getData().empty()) {
@@ -1584,6 +1623,7 @@ bool WifiChip::writeRingbufferFilesInternal() {
                 PLOG(ERROR) << "Error writing to file";
             }
         }
+    }
     }
     return true;
 }
